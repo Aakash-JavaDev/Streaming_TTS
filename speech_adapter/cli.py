@@ -28,7 +28,8 @@ def build_parser() -> argparse.ArgumentParser:
     manifest.add_argument("--force", action="store_true")
     commands.add_parser("prepare-features", help="prepare indexed or recomputed Qwen features")
     commands.add_parser("structural-checks", help="run causal and CB0-gradient tests")
-    commands.add_parser("local-smoke", help="run one bounded CPU forward/backward/cache check")
+    commands.add_parser("smoke", help="run one bounded CPU/CUDA forward/backward/cache check")
+    commands.add_parser("local-smoke", help="alias for smoke (device comes from runtime config)")
     commands.add_parser("codec-contract", help="verify Mimi encoder/decoder codebook compatibility")
     commands.add_parser("gate-a", help="run codec oracle diagnostics")
     commands.add_parser("gate-b", help="render alignment review panels")
@@ -86,10 +87,10 @@ def main(argv: list[str] | None = None) -> None:
         print(json.dumps(report, indent=2))
         if not report["automatic_pass"]:
             raise SystemExit(2)
-    elif args.command == "local-smoke":
-        from .smoke import run_local_smoke
+    elif args.command in {"smoke", "local-smoke"}:
+        from .smoke import run_smoke
 
-        report = run_local_smoke(cfg)
+        report = run_smoke(cfg)
         print(json.dumps(report, indent=2))
         if not report["automatic_pass"]:
             raise SystemExit(2)

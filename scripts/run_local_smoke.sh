@@ -26,13 +26,13 @@ echo "[2/7] Mimi eight-codebook contract"
 run_adapter codec-contract
 echo "[3/7] Limited manifest"
 run_adapter prepare-manifest
-echo "[4/7] Plain-answer Qwen 0.5B features"
+echo "[4/7] Plain-answer Qwen features"
 run_adapter prepare-features
 echo "[5/7] Causality, KV-cache, and CB0 checks"
 run_adapter structural-checks
 echo "[6/7] One bounded real-data optimizer/rollout check"
-run_adapter local-smoke
+run_adapter smoke
 echo "[7/7] Twenty-record, one-epoch training-loop check"
 run_adapter train --experiment smoke_cpu --limit 20 --epochs 1
 
-echo "Local smoke checks passed. Report: local_work/qwen_0.5b_cpu/local_smoke_report.json"
+echo "Local smoke checks passed. Report: local_work/qwen_0.5b_cpu/smoke_report.json"
