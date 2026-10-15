@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+runs/
+*.pt
+*.safetensors
+*.npy
+*.npz
+*.wav

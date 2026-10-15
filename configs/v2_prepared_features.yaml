@@ -1,0 +1,18 @@
+# Reuse the repository's EXISTING manifest.jsonl + features sidecars.
+# First point this to your actual working legacy JSON config. Its paths.work_dir
+# must contain manifest.jsonl and features/features.done.json.
+data:
+  legacy_config: configs/legacy_dataset.json
+  model_id: Qwen/Qwen2.5-1.5B-Instruct
+  hidden_layer: final_normalized
+  hidden_alignment: after_consuming_token
+model:
+  hidden_dim: 1536
+  embedding_dim: 1536
+train:
+  device: auto
+  precision: fp32
+  batch_size: 4
+  eval_samples: 8
+  max_generate_frames: 300
+work_dir: runs/v2-prepared

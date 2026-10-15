@@ -343,50 +343,11 @@ def load_feature_index(path: str | Path) -> dict[str, dict[str, Any]]:
 
 def _qwen_embedding_rows(model_dir: str | Path, token_ids: np.ndarray) -> np.ndarray:
     """Read Qwen's embedding tensor without constructing the full language model."""
-    from safetensors import safe_open
+    from .v2.embeddings import embedding_rows
 
-    root = Path(model_dir)
-    keys = (
-        "model.embed_tokens.weight",
-        "model.model.embed_tokens.weight",
-        "transformer.wte.weight",
-        "lm_head.weight",
-    )
-    tensor_path: Path | None = None
-    tensor_key: str | None = None
-    indices = sorted(root.glob("*.safetensors.index.json"))
-    if indices:
-        weight_map = json.loads(indices[0].read_text(encoding="utf-8")).get("weight_map", {})
-        for key in keys:
-            filename = weight_map.get(key)
-            if filename:
-                tensor_path, tensor_key = root / filename, key
-                break
-    if tensor_path is None:
-        for path in sorted(root.glob("*.safetensors")):
-            with safe_open(path, framework="pt", device="cpu") as handle:
-                available = set(handle.keys())
-            tensor_key = next((key for key in keys if key in available), None)
-            if tensor_key is not None:
-                tensor_path = path
-                break
-    if tensor_path is None or tensor_key is None:
-        raise FileNotFoundError(
-            f"could not find Qwen input embeddings in safetensors under {root}"
-        )
-    print(f"loading Qwen embedding only: {tensor_path.name}:{tensor_key}", flush=True)
-    with safe_open(tensor_path, framework="pt", device="cpu") as handle:
-        table = handle.get_tensor(tensor_key)
-    ids = np.asarray(token_ids, dtype=np.int64)
-    if ids.size and (int(ids.min()) < 0 or int(ids.max()) >= int(table.shape[0])):
-        raise RuntimeError(
-            f"token ID range [{ids.min()},{ids.max()}] exceeds {table.shape[0]} embedding rows"
-        )
-    import torch
-
-    selected = table.index_select(0, torch.from_numpy(ids)).float().numpy().astype(np.float16)
-    del table
-    return selected
+    # A standalone lm_head is only a valid fallback when the checkpoint explicitly
+    # ties its output/input weights. The v2 extractor enforces that contract.
+    return embedding_rows(model_dir, token_ids)
 
 
 def _feature_worker(cfg: AppConfig) -> tuple[Any, Any, int, int, int, Any]:
@@ -841,7 +802,7 @@ class SpeechDataset:
         return {
             "record_id": row["record_id"],
             "text": row["answer"],
-            "hidden": torch.from_numpy(np.asarray(hidden, dtype=np.float32)),
+            "hidden": torch.from_numpy(np.asarray(hidden, dtype=np.float32).copy()),
             "embeddings": torch.from_numpy(embeddings),
             "durations": torch.from_numpy(durations),
             "codes": torch.from_numpy(codes.copy()),
