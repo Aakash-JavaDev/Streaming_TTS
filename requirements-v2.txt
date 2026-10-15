@@ -1,0 +1,5 @@
+# Install the torch wheel appropriate to your CPU/CUDA environment first.
+torch>=2.4
+numpy>=1.26
+PyYAML>=6.0
+safetensors>=0.4

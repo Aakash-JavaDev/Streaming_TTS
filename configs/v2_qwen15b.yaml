@@ -1,0 +1,40 @@
+# Direct NPZ dataset. Paths are relative to the command's working directory.
+model:
+  hidden_dim: 1536
+  embedding_dim: 1536
+  width: 512
+  heads: 8
+  ffn_dim: 1536
+  cb0_layers: 4
+  acoustic_layers: 2
+  code_embedding_dim: 128
+  codec_vocab: 2048
+  num_codebooks: 8
+  dropout: 0.1
+  max_audio_frames: 1500
+  max_text_tokens: 2048
+data:
+  manifest: data/manifest.jsonl
+  codes_layout: K_T
+  embedding_cache: ""
+  model_id: Qwen/Qwen2.5-1.5B-Instruct
+  model_revision: ""  # Record the exact checkpoint revision used by your dataset.
+  hidden_layer: final_normalized
+  hidden_alignment: after_consuming_token  # Change if cached predictor states were used.
+train:
+  seed: 42
+  epochs: 20
+  batch_size: 8
+  learning_rate: 0.0003
+  weight_decay: 0.01
+  stop_weight: 0.1
+  grad_clip: 1.0
+  num_workers: 0
+  device: auto
+  precision: fp32  # T4: select fp16; bf16 requires compatible hardware.
+  cpu_threads: 2
+  eval_samples: 8
+  min_generate_frames: 1
+  max_generate_frames: 300
+  stop_threshold: 0.5
+work_dir: runs/v2-qwen15b
