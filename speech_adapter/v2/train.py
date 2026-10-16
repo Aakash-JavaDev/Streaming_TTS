@@ -5,6 +5,7 @@ import json
 import math
 import os
 import random
+import time
 from pathlib import Path
 
 import numpy as np
@@ -50,6 +51,52 @@ def amp_context(cfg: V2Config, device: torch.device):
     return torch.autocast("cuda", dtype=dtype)
 
 
+def all_ranks_finite(value: torch.Tensor) -> bool:
+    flag = torch.isfinite(value).all().to(dtype=torch.int32)
+    if dist.is_initialized():
+        dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+    return bool(flag.item())
+
+
+def optimizer_step(optimizer, scaler, parameters, max_norm: float) -> tuple[float, bool]:
+    """Skip an AMP overflow on EVERY rank before any optimizer can update."""
+    scaler.unscale_(optimizer)
+    norm = torch.nn.utils.clip_grad_norm_(parameters, max_norm, error_if_nonfinite=False)
+    finite = all_ranks_finite(norm)
+    if not finite:
+        optimizer.zero_grad(set_to_none=True)
+        if not scaler.is_enabled():
+            raise RuntimeError("non-finite gradient norm without FP16 scaling")
+        # Explicit public update makes even a rank with finite local gradients
+        # skip and back off. Never let ranks independently update their weights.
+        scale = scaler.get_scale() * scaler.get_backoff_factor()
+        if not math.isfinite(scale) or scale <= 0:
+            raise RuntimeError("FP16 gradient scale became invalid")
+        scaler.update(new_scale=scale)
+        state = scaler.state_dict()
+        state["_growth_tracker"] = 0
+        scaler.load_state_dict(state)
+        return float(norm), False
+    scaler.step(optimizer)
+    scaler.update()
+    return float(norm), True
+
+
+def record_context(batch: dict) -> list:
+    local = batch["record_ids"]
+    if not dist.is_initialized():
+        return [local]
+    records = [None] * dist.get_world_size()
+    dist.all_gather_object(records, local)
+    return records
+
+
+def write_event(path: Path, event: dict) -> None:
+    with path.open("a") as out:
+        out.write(json.dumps(event, allow_nan=False) + "\n")
+    print(json.dumps(event, allow_nan=False), flush=True)
+
+
 @torch.inference_mode()
 def evaluate(model: TwoStageTTS, dataset, cfg: V2Config, device: torch.device, limit: int | None = None) -> dict:
     was_training = model.training
@@ -91,7 +138,8 @@ def run_training(cfg: V2Config, phase: str, init: str = "", resume: str = "", li
     device = select_device(cfg)
     rank, world = int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
     if world > 1 and not dist.is_initialized():
-        dist.init_process_group("nccl" if device.type == "cuda" else "gloo")
+        kwargs = {"device_id": device} if device.type == "cuda" else {}
+        dist.init_process_group("nccl" if device.type == "cuda" else "gloo", **kwargs)
     random.seed(cfg.train.seed)
     np.random.seed(cfg.train.seed)
     torch.manual_seed(cfg.train.seed)
@@ -110,7 +158,8 @@ def run_training(cfg: V2Config, phase: str, init: str = "", resume: str = "", li
         model = TwoStageTTS(cfg.model).to(device)
     model.set_phase(phase)
     model.train()
-    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
+    parameters = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(parameters,
                                  lr=cfg.train.learning_rate, weight_decay=cfg.train.weight_decay)
     start_epoch = 0
     if resume:
@@ -128,18 +177,24 @@ def run_training(cfg: V2Config, phase: str, init: str = "", resume: str = "", li
     loader = DataLoader(train_data, batch_size=cfg.train.batch_size, shuffle=sampler is None,
                         sampler=sampler, num_workers=cfg.train.num_workers, collate_fn=collate)
     wrapped = DDP(model, device_ids=[device.index] if device.type == "cuda" else None) if world > 1 else model
-    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and cfg.train.precision == "fp16")
+    scaler = torch.amp.GradScaler("cuda", init_scale=cfg.train.amp_init_scale,
+                                 enabled=device.type == "cuda" and cfg.train.precision == "fp16")
     if resume and payload["extra"].get("scaler"):
         scaler.load_state_dict(payload["extra"]["scaler"])
     work = Path(cfg.work_dir)
     history_path = work / f"{phase}_history.jsonl"
+    steps_path = work / f"{phase}_steps.jsonl"
     if rank == 0:
         work.mkdir(parents=True, exist_ok=True)
         atomic_json(work / "config.json", cfg.to_dict())
         if not resume:
             history_path.write_text("")
+            steps_path.write_text("")
     best = float(payload["extra"].get("best", float("inf"))) if resume else float("inf")
-    global_step = start_epoch * len(loader)
+    global_step = int(payload["extra"].get("global_step", start_epoch * len(loader))) if resume else 0
+    optimizer_steps = int(payload["extra"].get("optimizer_steps", global_step)) if resume else 0
+    skipped_updates = int(payload["extra"].get("skipped_updates", 0)) if resume else 0
+    consecutive_overflows = 0
     total_steps = cfg.train.epochs * len(loader)
     warmup = max(1, int(total_steps * cfg.train.warmup_fraction))
     final_report = {}
@@ -149,7 +204,9 @@ def run_training(cfg: V2Config, phase: str, init: str = "", resume: str = "", li
                 sampler.set_epoch(epoch)
             model.train()
             total, samples = 0.0, 0
-            for batch in loader:
+            window_loss, window_samples, window_stats = 0.0, 0, {}
+            window_started = time.perf_counter()
+            for epoch_step, batch in enumerate(loader, 1):
                 batch = move_batch(batch, device)
                 progress = max(0.0, (global_step - warmup) / max(1, total_steps - warmup))
                 factor = (global_step + 1) / warmup if global_step < warmup else 0.05 + 0.95 * (1 + math.cos(math.pi * progress)) / 2
@@ -158,19 +215,56 @@ def run_training(cfg: V2Config, phase: str, init: str = "", resume: str = "", li
                 optimizer.zero_grad(set_to_none=True)
                 with amp_context(cfg, device):
                     outputs = wrapped(batch)
-                    loss, _ = loss_for(phase, outputs, batch, cfg)
-                if not torch.isfinite(loss):
-                    raise RuntimeError(f"non-finite {phase} loss; records={batch['record_ids']}")
+                    loss, stats = loss_for(phase, outputs, batch, cfg)
+                if not all_ranks_finite(loss):
+                    raise RuntimeError(f"non-finite {phase} loss; records_by_rank={record_context(batch)}")
                 scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                norm = torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], cfg.train.grad_clip)
-                if not torch.isfinite(norm):
-                    raise RuntimeError("non-finite gradient norm")
-                scaler.step(optimizer)
-                scaler.update()
+                try:
+                    norm, updated = optimizer_step(optimizer, scaler, parameters, cfg.train.grad_clip)
+                except RuntimeError as exc:
+                    raise RuntimeError(f"{exc}; records_by_rank={record_context(batch)}") from exc
+                optimizer_steps += int(updated)
+                skipped_updates += int(not updated)
+                consecutive_overflows = 0 if updated else consecutive_overflows + 1
+                if not updated:
+                    records = record_context(batch)
+                    if rank == 0:
+                        write_event(steps_path, {"event": "amp_overflow", "phase": phase,
+                            "epoch": epoch, "step": global_step + 1, "epoch_step": epoch_step,
+                            "update_skipped": True, "grad_scale": scaler.get_scale(),
+                            "skipped_updates": skipped_updates, "records_by_rank": records})
+                    if consecutive_overflows >= cfg.train.max_consecutive_overflows:
+                        raise RuntimeError(f"persistent FP16 overflow ({consecutive_overflows} consecutive batches); "
+                                           f"try precision=fp32; records_by_rank={records}")
                 total += float(loss.detach()) * len(batch["record_ids"])
                 samples += len(batch["record_ids"])
                 global_step += 1
+                size = len(batch["record_ids"])
+                window_loss += float(loss.detach()) * size
+                window_samples += size
+                for key, value in stats.items():
+                    window_stats[key] = window_stats.get(key, 0.0) + float(value) * size
+                if cfg.train.step_size and (epoch_step % cfg.train.step_size == 0 or epoch_step == len(loader)):
+                    keys = sorted(window_stats)
+                    sums = torch.tensor([window_loss, window_samples] + [window_stats[k] for k in keys],
+                                        dtype=torch.float64, device=device)
+                    if world > 1:
+                        dist.all_reduce(sums)
+                    values = sums.tolist()
+                    elapsed = time.perf_counter() - window_started
+                    if rank == 0:
+                        write_event(steps_path, {"event": "train_step", "phase": phase,
+                            "epoch": epoch, "step": global_step, "epoch_step": epoch_step,
+                            "steps_per_epoch": len(loader), "optimizer_steps": optimizer_steps,
+                            "train_loss": values[0] / values[1],
+                            "metrics": {k: values[i + 2] / values[1] for i, k in enumerate(keys)},
+                            "learning_rate": optimizer.param_groups[0]["lr"],
+                            "grad_norm": norm if math.isfinite(norm) else None,
+                            "grad_scale": scaler.get_scale(), "update_skipped": not updated,
+                            "skipped_updates": skipped_updates, "window_samples": int(values[1]),
+                            "samples_per_second": values[1] / max(elapsed, 1e-9)})
+                    window_loss, window_samples, window_stats = 0.0, 0, {}
+                    window_started = time.perf_counter()
             if world > 1:
                 sums = torch.tensor([total, samples], dtype=torch.float64, device=device)
                 dist.all_reduce(sums)
@@ -179,13 +273,15 @@ def run_training(cfg: V2Config, phase: str, init: str = "", resume: str = "", li
             # inside a DDP forward while rank zero runs a different generation path.
             validation = evaluate(model, val_data, cfg, device)
             final_report = {"epoch": epoch, "phase": phase, "train_loss": total / samples,
-                            "validation": validation}
+                            "validation": validation, "step": global_step,
+                            "optimizer_steps": optimizer_steps, "skipped_updates": skipped_updates}
             if rank == 0:
                 with history_path.open("a") as out:
                     out.write(json.dumps(final_report) + "\n")
                 improved = validation["loss"] < best
                 best = min(best, validation["loss"])
-                extra = {"best": best, "scaler": scaler.state_dict()}
+                extra = {"best": best, "scaler": scaler.state_dict(), "global_step": global_step,
+                         "optimizer_steps": optimizer_steps, "skipped_updates": skipped_updates}
                 save_checkpoint(work / "checkpoints" / f"{phase}_last.pt", model, cfg, phase, epoch, optimizer, extra)
                 if improved:
                     save_checkpoint(work / "checkpoints" / f"{phase}_best.pt", model, cfg, phase, epoch, optimizer, extra)
@@ -196,3 +292,4 @@ def run_training(cfg: V2Config, phase: str, init: str = "", resume: str = "", li
     finally:
         if world > 1 and dist.is_initialized():
             dist.destroy_process_group()
+

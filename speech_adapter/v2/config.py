@@ -65,6 +65,9 @@ class Training:
     max_generate_frames: int = 300
     min_generate_frames: int = 1
     stop_threshold: float = 0.5
+    step_size: int = 50  # batch steps between progress logs; 0 disables
+    amp_init_scale: float = 4096.0
+    max_consecutive_overflows: int = 20
 
 
 @dataclass
@@ -112,6 +115,12 @@ class V2Config:
                 raise ValueError(f"train.{name} must be positive")
         if self.train.num_workers < 0 or self.train.learning_rate <= 0 or self.train.grad_clip <= 0:
             raise ValueError("invalid worker count, learning rate, or gradient clipping")
+        if (type(self.train.step_size) is not int or self.train.step_size < 0
+                or type(self.train.max_consecutive_overflows) is not int
+                or self.train.max_consecutive_overflows < 1):
+            raise ValueError("step_size must be a nonnegative integer; max_consecutive_overflows must be positive")
+        if not 0 < self.train.amp_init_scale < float("inf"):
+            raise ValueError("amp_init_scale must be positive and finite")
         if self.train.weight_decay < 0 or self.train.stop_weight < 0:
             raise ValueError("loss weight/weight decay must be nonnegative")
         if not 0 <= self.train.warmup_fraction < 1:
@@ -123,3 +132,4 @@ class V2Config:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
