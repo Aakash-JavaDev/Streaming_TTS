@@ -10,6 +10,9 @@ model:
   hidden_dim: 1536
   embedding_dim: 1536
 train:
+  step_size: 50  # Log every 50 batch steps per epoch, plus the final partial interval.
+  amp_init_scale: 4096
+  max_consecutive_overflows: 20
   device: auto
   precision: fp32
   batch_size: 4
