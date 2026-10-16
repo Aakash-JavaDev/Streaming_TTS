@@ -8,3 +8,5 @@ runs/
 *.npy
 *.npz
 *.wav
+data/
+models/

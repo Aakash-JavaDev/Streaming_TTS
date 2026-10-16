@@ -1,0 +1,15 @@
+{
+  "paths": {
+    "data_dir": "/home/lazarus_25/workspace/handsfree-chatbot/Streaming_TTS/data/",
+    "source_jsonl": "/home/lazarus_25/workspace/handsfree-chatbot/Streaming_TTS/data/input_json_file/dataset_question_answer_pair.jsonl",
+    "qwen_model": "/home/lazarus_25/workspace/handsfree-chatbot/Streaming_TTS/models/Qwen2.5-1.5B-Instruct-4bit",
+    "work_dir": "/home/lazarus_25/workspace/handsfree-chatbot/Streaming_TTS/data"
+  },
+  "feature_mode": "legacy_answer",
+  "runtime": {
+    "device": "cpu",
+    "profile": "local_cpu",
+    "require_two_gpus": false,
+    "cpu_threads": 2
+  }
+}

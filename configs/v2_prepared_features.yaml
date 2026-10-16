@@ -18,5 +18,4 @@ train:
   batch_size: 4
   eval_samples: 8
   max_generate_frames: 300
-work_dir: runs/v2-prepared
-
+work_dir: runs/v2-prepared-acoustic
